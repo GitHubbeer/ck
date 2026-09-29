@@ -165,7 +165,8 @@ int main(int argc, char** argv) try {
   constexpr int blocks_n = sizeof(H) / sizeof(H[0]);
   std::vector<int> offsets(blocks_n), lds(blocks_n);
   int M = 0;
-  for (int i = 0; i < blocks_n; ++i) { offsets[i] = M; lds[i] = M + H[i]; M += H[i]; }
+  for (int i = 0; i < blocks_n; ++i) { offsets[i] = M; M += H[i]; }
+  for (int i = 0; i < blocks_n; ++i) lds[i] = M - offsets[i];
   const int N = M, K = 511;
   std::cout << "M=N=" << M << " K=" << K << " block_count=" << blocks_n << '\n';
 
