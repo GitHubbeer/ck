@@ -29,13 +29,18 @@ template <ck::index_t... I> using Seq = ck::Sequence<I...>;
 constexpr auto GemmPad = ck::tensor_operation::device::GemmSpecialization::MNKPadding;
 
 // The same gfx9 FP64 XDL tile used by CK's mk/kn/mn instance family.
-using DeviceGemm = ck::tensor_operation::device::DeviceGemmXdl<
+template <int PrefetchStages>
+using DeviceGemmFor = ck::tensor_operation::device::DeviceGemmXdl<
     F64, F64, F64, F64, Col, Row, Row, Pass, Pass, Pass, GemmPad,
     256, 128, 128, 4, 2, 16, 16, 4, 4,
     Seq<4, 64, 1>, Seq<0, 2, 1>, Seq<0, 2, 1>, 1, 2, 2, true,
-    Seq<4, 64, 1>, Seq<0, 2, 1>, Seq<0, 2, 1>, 1, 2, 2, true, 7, 1>;
-using Gridwise = typename DeviceGemm::template GridwiseGemmBase<
-    decltype(DeviceGemm::WarpTileConfig64)>;
+    Seq<4, 64, 1>, Seq<0, 2, 1>, Seq<0, 2, 1>, 1, 2, 2, true,
+    7, 1, PrefetchStages>;
+template <int PrefetchStages>
+using GridwiseFor = typename DeviceGemmFor<PrefetchStages>::template GridwiseGemmBase<
+    decltype(DeviceGemmFor<PrefetchStages>::WarpTileConfig64)>;
+using DeviceGemm = DeviceGemmFor<1>;
+using Gridwise = GridwiseFor<1>;
 using Argument = typename Gridwise::Argument;
 constexpr int TileM = 128;
 constexpr int TileN = 128;
@@ -64,14 +69,17 @@ __global__ void scatter_reference(const double* dense_col_major, int m,
   else block[static_cast<long>(lr) * lds[bi] + lc] -= dense_col_major[pos];
 }
 
-template <bool HasMainKLoop, bool DoScatter>
-__global__ void ck_gemm_scatter_kernel(Argument arg, double* dense,
+template <int PrefetchStages, bool HasMainKLoop, bool DoScatter>
+__global__ void ck_gemm_scatter_kernel(
+                                       typename GridwiseFor<PrefetchStages>::Argument arg,
+                                       double* dense,
                                        double* const* blocks,
                                        const int* offsets, const int* lds,
                                        int block_count) {
   // Execute the public CK Gridwise GEMM tile, then consume its tile result
   // immediately in this CTA. dense is a workspace, never a separately
   // launched producer/consumer stage.
+  using Gridwise = GridwiseFor<PrefetchStages>;
   const auto a_desc = Gridwise::MakeAGridDescriptor_K0_M_K1(
       arg.M, arg.MPadded, arg.K, arg.K0, arg.StrideA);
   const auto b_desc = Gridwise::MakeBGridDescriptor_K0_N_K1(
@@ -213,33 +221,49 @@ int main(int argc, char** argv) try {
   // column-major NxK input expected by the reference's transposed GEMM.
   Argument arg{dA.as<double>(), dB.as<double>(), dDense.as<double>(),
                M,N,K,M,N,N};
+  typename GridwiseFor<2>::Argument arg_db{dA.as<double>(), dB.as<double>(),
+                                           dDense.as<double>(), M,N,K,M,N,N};
   if (!Gridwise::CheckValidity(arg))
     throw std::runtime_error("CK Gridwise GEMM does not support this shape/configuration");
   const int grid = ((M + TileM - 1)/TileM) * ((N + TileN - 1)/TileN);
-  const auto launch_fused = [&] {
-    if (Gridwise::CalculateHasMainKBlockLoop(K))
-      hipLaunchKernelGGL((ck_gemm_scatter_kernel<true, true>), dim3(grid), dim3(256), 0, 0,
-                         arg, dDense.as<double>(), dBlocks.as<double*>(),
-                         dOffsets.as<int>(), dLds.as<int>(), blocks_n);
-    else
-      hipLaunchKernelGGL((ck_gemm_scatter_kernel<false, true>), dim3(grid), dim3(256), 0, 0,
-                         arg, dDense.as<double>(), dBlocks.as<double*>(),
-                         dOffsets.as<int>(), dLds.as<int>(), blocks_n);
-    check(hipGetLastError(), "launch fused CK GEMM-scatter");
+  const auto launch_variant = [&](int prefetch_stages, bool do_scatter) {
+    const bool has_main_loop = prefetch_stages == 1
+        ? Gridwise::CalculateHasMainKBlockLoop(K)
+        : GridwiseFor<2>::CalculateHasMainKBlockLoop(K);
+#define LAUNCH_GEMM_VARIANT(STAGES, MAIN, SCATTER, KARG)                       \
+    hipLaunchKernelGGL((ck_gemm_scatter_kernel<STAGES, MAIN, SCATTER>),         \
+                       dim3(grid), dim3(256), 0, 0, KARG, dDense.as<double>(),  \
+                       dBlocks.as<double*>(), dOffsets.as<int>(),              \
+                       dLds.as<int>(), blocks_n)
+    if (prefetch_stages == 1) {
+      if (do_scatter) {
+        if (has_main_loop) LAUNCH_GEMM_VARIANT(1, true, true, arg);
+        else LAUNCH_GEMM_VARIANT(1, false, true, arg);
+      } else {
+        if (has_main_loop) LAUNCH_GEMM_VARIANT(1, true, false, arg);
+        else LAUNCH_GEMM_VARIANT(1, false, false, arg);
+      }
+    } else if (prefetch_stages == 2) {
+      if (do_scatter) {
+        if (has_main_loop) LAUNCH_GEMM_VARIANT(2, true, true, arg_db);
+        else LAUNCH_GEMM_VARIANT(2, false, true, arg_db);
+      } else {
+        if (has_main_loop) LAUNCH_GEMM_VARIANT(2, true, false, arg_db);
+        else LAUNCH_GEMM_VARIANT(2, false, false, arg_db);
+      }
+    } else {
+      throw std::runtime_error("unsupported prefetch stage count");
+    }
+#undef LAUNCH_GEMM_VARIANT
+    check(hipGetLastError(), do_scatter ? "launch fused CK GEMM-scatter"
+                                        : "launch CK GEMM-only");
   };
-  if (std::getenv("CK_GS_DEBUG_GEMM_ONLY")) {
-    if (Gridwise::CalculateHasMainKBlockLoop(K))
-      hipLaunchKernelGGL((ck_gemm_scatter_kernel<true, false>), dim3(grid), dim3(256), 0, 0,
-                         arg, dDense.as<double>(), dBlocks.as<double*>(),
-                         dOffsets.as<int>(), dLds.as<int>(), blocks_n);
-    else
-      hipLaunchKernelGGL((ck_gemm_scatter_kernel<false, false>), dim3(grid), dim3(256), 0, 0,
-                         arg, dDense.as<double>(), dBlocks.as<double*>(),
-                         dOffsets.as<int>(), dLds.as<int>(), blocks_n);
-    check(hipGetLastError(), "launch CK GEMM-only diagnostic");
-    check(hipDeviceSynchronize(), "CK GEMM-only diagnostic sync");
-    std::cout << "CK GEMM-only passed\n";
-  }
+  const auto launch_fused = [&] { launch_variant(1, true); };
+  const auto launch_fused_db = [&] { launch_variant(2, true); };
+  const auto launch_gemm_only = [&] { launch_variant(1, false); };
+  const auto launch_gemm_only_db = [&] { launch_variant(2, false); };
+  if (!GridwiseFor<2>::CheckValidity(arg_db))
+    throw std::runtime_error("CK double-buffered GEMM does not support this shape/configuration");
 
   rocblas_handle blas;
   check_blas(rocblas_create_handle(&blas), "rocblas_create_handle");
@@ -287,21 +311,44 @@ int main(int argc, char** argv) try {
     check(hipMemcpy(fusedL[i].data(),dL[i].p,L[i].size()*sizeof(double),hipMemcpyDeviceToHost),"read fused L");
     check(hipMemcpy(fusedU[i].data(),dU[i].p,U[i].size()*sizeof(double),hipMemcpyDeviceToHost),"read fused U");
   }
+  reset(); launch_fused_db(); check(hipDeviceSynchronize(), "double-buffered fused correctness sync");
+  std::vector<std::vector<double>> fusedDbL(blocks_n), fusedDbU(blocks_n);
+  for (int i=0;i<blocks_n;++i) {
+    fusedDbL[i].resize(L[i].size()); fusedDbU[i].resize(U[i].size());
+    check(hipMemcpy(fusedDbL[i].data(),dL[i].p,L[i].size()*sizeof(double),hipMemcpyDeviceToHost),"read double-buffered fused L");
+    check(hipMemcpy(fusedDbU[i].data(),dU[i].p,U[i].size()*sizeof(double),hipMemcpyDeviceToHost),"read double-buffered fused U");
+  }
   reset(); launch_reference(); check(hipDeviceSynchronize(), "reference correctness sync");
   double max_diff = 0;
+  double max_diff_db = 0;
   for (int i=0;i<blocks_n;++i) {
     check(hipMemcpy(L[i].data(),dL[i].p,L[i].size()*sizeof(double),hipMemcpyDeviceToHost),"read ref L");
     check(hipMemcpy(U[i].data(),dU[i].p,U[i].size()*sizeof(double),hipMemcpyDeviceToHost),"read ref U");
-    for (size_t x=0;x<L[i].size();++x) max_diff=std::max(max_diff,std::abs(L[i][x]-fusedL[i][x]));
-    for (size_t x=0;x<U[i].size();++x) max_diff=std::max(max_diff,std::abs(U[i][x]-fusedU[i][x]));
+    for (size_t x=0;x<L[i].size();++x) {
+      max_diff=std::max(max_diff,std::abs(L[i][x]-fusedL[i][x]));
+      max_diff_db=std::max(max_diff_db,std::abs(L[i][x]-fusedDbL[i][x]));
+    }
+    for (size_t x=0;x<U[i].size();++x) {
+      max_diff=std::max(max_diff,std::abs(U[i][x]-fusedU[i][x]));
+      max_diff_db=std::max(max_diff_db,std::abs(U[i][x]-fusedDbU[i][x]));
+    }
   }
-  std::cout << "max_abs_diff=" << max_diff << '\n';
+  std::cout << "max_abs_diff_prefetch1=" << max_diff
+            << " max_abs_diff_prefetch2=" << max_diff_db << '\n';
   if (max_diff > 1e-10) throw std::runtime_error("fused result differs from rocBLAS+scatter");
+  if (max_diff_db > 1e-10) throw std::runtime_error("double-buffered fused result differs from rocBLAS+scatter");
 
+  const float gemm_ms = time_call(launch_gemm_only);
+  const float gemm_db_ms = time_call(launch_gemm_only_db);
   const float fused_ms = time_call(launch_fused);
+  const float fused_db_ms = time_call(launch_fused_db);
   const float reference_ms = time_call(launch_reference);
-  std::cout << "fused_ms,rocblas_plus_scatter_ms,speedup\n"
-            << fused_ms << ',' << reference_ms << ',' << reference_ms/fused_ms << '\n';
+  std::cout << "ck_gemm_prefetch1_ms,ck_gemm_prefetch2_ms,fused_prefetch1_ms,"
+               "fused_prefetch2_ms,rocblas_plus_scatter_ms\n"
+            << gemm_ms << ',' << gemm_db_ms << ',' << fused_ms << ','
+            << fused_db_ms << ',' << reference_ms << '\n';
+  std::cout << "speedup_prefetch1=" << reference_ms/fused_ms
+            << " speedup_prefetch2=" << reference_ms/fused_db_ms << '\n';
   check_blas(rocblas_destroy_handle(blas), "rocblas_destroy_handle");
   return 0;
 } catch (const std::exception& e) {
