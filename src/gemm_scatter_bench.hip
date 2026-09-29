@@ -64,7 +64,7 @@ __global__ void scatter_reference(const double* dense_col_major, int m,
   else block[static_cast<long>(lr) * lds[bi] + lc] -= dense_col_major[pos];
 }
 
-template <bool HasMainKLoop>
+template <bool HasMainKLoop, bool DoScatter>
 __global__ void ck_gemm_scatter_kernel(Argument arg, double* dense,
                                        double* const* blocks,
                                        const int* offsets, const int* lds,
@@ -82,6 +82,7 @@ __global__ void ck_gemm_scatter_kernel(Argument arg, double* dense,
 
   Gridwise::template Run<HasMainKLoop>(arg.p_a_grid, arg.p_b_grid, dense,
                                        smem, a_desc, b_desc, c_desc);
+  if constexpr (DoScatter) {
   __threadfence_block();
   __syncthreads();
 
@@ -122,6 +123,7 @@ __global__ void ck_gemm_scatter_kernel(Argument arg, double* dense,
     const double v = dense[static_cast<long>(i) * arg.StrideC + j];
     if (bi >= bj) block[r + static_cast<long>(c) * col_ld[cj]] -= v;
     else block[static_cast<long>(r) * row_ld[ri] + c] -= v;
+  }
   }
 }
 
@@ -215,15 +217,28 @@ int main(int argc, char** argv) try {
   const int grid = ((M + TileM - 1)/TileM) * ((N + TileN - 1)/TileN);
   const auto launch_fused = [&] {
     if (Gridwise::CalculateHasMainKBlockLoop(K))
-      hipLaunchKernelGGL((ck_gemm_scatter_kernel<true>), dim3(grid), dim3(256), 0, 0,
+      hipLaunchKernelGGL((ck_gemm_scatter_kernel<true, true>), dim3(grid), dim3(256), 0, 0,
                          arg, dDense.as<double>(), dBlocks.as<double*>(),
                          dOffsets.as<int>(), dLds.as<int>(), blocks_n);
     else
-      hipLaunchKernelGGL((ck_gemm_scatter_kernel<false>), dim3(grid), dim3(256), 0, 0,
+      hipLaunchKernelGGL((ck_gemm_scatter_kernel<false, true>), dim3(grid), dim3(256), 0, 0,
                          arg, dDense.as<double>(), dBlocks.as<double*>(),
                          dOffsets.as<int>(), dLds.as<int>(), blocks_n);
     check(hipGetLastError(), "launch fused CK GEMM-scatter");
   };
+  if (std::getenv("CK_GS_DEBUG_GEMM_ONLY")) {
+    if (Gridwise::CalculateHasMainKBlockLoop(K))
+      hipLaunchKernelGGL((ck_gemm_scatter_kernel<true, false>), dim3(grid), dim3(256), 0, 0,
+                         arg, dDense.as<double>(), dBlocks.as<double*>(),
+                         dOffsets.as<int>(), dLds.as<int>(), blocks_n);
+    else
+      hipLaunchKernelGGL((ck_gemm_scatter_kernel<false, false>), dim3(grid), dim3(256), 0, 0,
+                         arg, dDense.as<double>(), dBlocks.as<double*>(),
+                         dOffsets.as<int>(), dLds.as<int>(), blocks_n);
+    check(hipGetLastError(), "launch CK GEMM-only diagnostic");
+    check(hipDeviceSynchronize(), "CK GEMM-only diagnostic sync");
+    std::cout << "CK GEMM-only passed\n";
+  }
 
   rocblas_handle blas;
   check_blas(rocblas_create_handle(&blas), "rocblas_create_handle");
